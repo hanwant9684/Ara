@@ -1,0 +1,12 @@
+pyrogram==2.0.106
+tgcrypto
+yt-dlp
+psycopg2-binary
+PyGithub
+aiohttp
+aiofiles
+python-dotenv
+apscheduler
+humanize
+cryptg
+curl_cffi
