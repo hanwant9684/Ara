@@ -2,7 +2,7 @@ import os
 import logging
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from bot.db import get_or_create_user, add_premium, revoke_premium, get_user, add_payment_request
-from bot.helpers import PLANS, PAYMENT_METHODS, format_time_left
+from bot.helpers import PLANS, PAYMENT_METHODS, format_time_left, is_url, admin_link, admin_url
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +15,14 @@ PAYMENT_DETAILS = {
     "credit_card": os.environ.get("CARD_INFO",      ""),
     "upi":         os.environ.get("UPI_ID",         ""),
 }
+
+
+def _admin_button() -> list | None:
+    """Return a 'Contact Admin' button row if ADMIN_USERNAME is set."""
+    url = admin_url()
+    if url:
+        return [InlineKeyboardButton("💬 Contact Admin", url=url)]
+    return None
 
 
 async def plans_handler(client, message: Message):
@@ -34,11 +42,18 @@ async def plans_handler(client, message: Message):
             callback_data=f"buy_{key}",
         )])
 
+    contact_note = f"Questions? Message {admin_link()}." if admin_url() else ""
     lines += [
         "",
-        "After paying, send your payment screenshot to the admin and"
-        " you'll be activated within 24 hours.",
+        "After paying, send your receipt to the admin and you'll be activated within 24 hours.",
     ]
+    if contact_note:
+        lines.append(contact_note)
+
+    # Add contact admin button at the bottom
+    admin_btn = _admin_button()
+    if admin_btn:
+        buttons.append(admin_btn)
 
     await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -58,6 +73,10 @@ async def _show_payment_methods(message, plan_key: str):
         [InlineKeyboardButton(name, callback_data=f"pay_{plan_key}_{key}")]
         for key, name in PAYMENT_METHODS.items()
     ]
+    admin_btn = _admin_button()
+    if admin_btn:
+        buttons.append(admin_btn)
+
     text = f"💎 **{plan['label']} — ${plan['price_usd']}**\n\nHow do you want to pay?"
     await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -86,8 +105,22 @@ async def payment_method_callback(client, callback_query: CallbackQuery):
         await callback_query.answer("Something went wrong. Try again.", show_alert=True)
         return
 
-    detail_line = f"`{payment_detail}`" if payment_detail else "_Contact admin for payment details_"
+    buttons = []
 
+    # URL → clickable button; anything else → copyable code in the message
+    if payment_detail and is_url(payment_detail):
+        detail_line = "_Tap the button below to open the payment page._"
+        buttons.append([InlineKeyboardButton(f"Pay via {method_name} 💳", url=payment_detail)])
+    elif payment_detail:
+        detail_line = f"`{payment_detail}`"
+    else:
+        detail_line = f"_Contact {admin_link()} for payment details._"
+
+    admin_btn = _admin_button()
+    if admin_btn:
+        buttons.append(admin_btn)
+
+    admin_contact = admin_link()
     text = (
         f"**How to pay — {method_name}**\n\n"
         f"Plan: **{plan['label']}**\n"
@@ -95,13 +128,16 @@ async def payment_method_callback(client, callback_query: CallbackQuery):
         f"Send to:\n{detail_line}\n\n"
         f"Once paid:\n"
         f"1. Screenshot your receipt\n"
-        f"2. Send it to the admin along with:\n"
+        f"2. Send it to {admin_contact} along with:\n"
         f"   — Your ID: `{user.id}`\n"
         f"   — Request: `#{request_id}`\n\n"
         f"You'll be activated within 24 hours."
     )
 
-    await callback_query.message.edit_text(text)
+    await callback_query.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
+    )
 
     for admin_id in ADMIN_IDS:
         try:

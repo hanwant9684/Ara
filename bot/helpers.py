@@ -1,3 +1,4 @@
+import os
 import re
 from datetime import datetime
 import humanize
@@ -17,6 +18,7 @@ _BARE_DOMAIN_RE = re.compile(
     re.IGNORECASE,
 )
 
+
 PLANS = {
     "10days": {"days": 10, "price_usd": 2.99,  "label": "10 Days"},
     "30days": {"days": 30, "price_usd": 6.99,  "label": "30 Days"},
@@ -31,6 +33,26 @@ PAYMENT_METHODS = {
     "credit_card": "Credit / Debit Card",
     "upi":         "UPI",
 }
+
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "").strip().lstrip("@")
+
+
+def admin_link() -> str:
+    """Return a clickable @admin mention, or plain 'admin' if not set."""
+    if ADMIN_USERNAME:
+        return f"[@{ADMIN_USERNAME}](https://t.me/{ADMIN_USERNAME})"
+    return "the admin"
+
+
+def admin_url() -> str | None:
+    """Return the admin's t.me URL, or None if not set."""
+    if ADMIN_USERNAME:
+        return f"https://t.me/{ADMIN_USERNAME}"
+    return None
+
+
+def is_url(value: str) -> bool:
+    return value.strip().startswith(("http://", "https://"))
 
 
 def extract_url(text: str) -> str | None:
@@ -76,6 +98,8 @@ def progress_bar(percent: int, length: int = 10) -> str:
 
 
 def get_help_text(is_admin: bool = False) -> str:
+    contact = f"\n**Support:** {admin_link()}" if ADMIN_USERNAME else ""
+
     text = (
         "**📥 Video Downloader Bot**\n\n"
         "Drop any video link and I'll download it for you — that's it.\n\n"
@@ -89,7 +113,8 @@ def get_help_text(is_admin: bool = False) -> str:
         "/plans — See premium pricing\n\n"
         "**Free plan:** 10 downloads (lifetime)\n"
         "**Premium:** Unlimited, all platforms\n\n"
-        "**Payment options:** PayPal • Crypto • Apple Pay • Card • UPI"
+        f"**Payment options:** PayPal • Crypto • Apple Pay • Card • UPI"
+        f"{contact}"
     )
 
     if is_admin:
