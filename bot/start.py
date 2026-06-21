@@ -128,11 +128,23 @@ async def button_handler(client, callback_query: CallbackQuery):
             await callback_query.message.edit_text(text, reply_markup=buttons)
 
         elif data == "plans":
-            lines = ["💎 **Premium Plans**\n"]
+            from bot.helpers import admin_url
+            lines = ["💎 **Premium Plans**\n\nUnlimited downloads on every platform.\n"]
+            buttons = []
             for key, plan in PLANS.items():
                 lines.append(f"• **{plan['label']}** — ${plan['price_usd']}")
-            lines.append("\nTap a plan below to buy.")
-            await callback_query.message.edit_text("\n".join(lines))
+                buttons.append([InlineKeyboardButton(
+                    f"{plan['label']}  —  ${plan['price_usd']}",
+                    callback_data=f"buy_{key}",
+                )])
+            lines.append("\nAfter paying, send your receipt to the admin and you'll be activated within 24 hours.")
+            url = admin_url()
+            if url:
+                buttons.append([InlineKeyboardButton("💬 Contact Admin", url=url)])
+            await callback_query.message.edit_text(
+                "\n".join(lines),
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
 
     except Exception:
         logger.exception("Error in button_handler (data=%s, user=%d)", data, user.id)
