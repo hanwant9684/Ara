@@ -1,13 +1,18 @@
 import logging
 import asyncio
+import time
 import tempfile
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait
 from bot.db import get_or_create_user, try_consume_download, record_download, is_premium, get_user
 from bot.downloader import download_video, ProgressTracker, detect_platform, get_video_info
 from bot.helpers import extract_url, format_size, format_duration, progress_bar
+from bot.forcesub import is_subscribed, send_join_prompt, FORCE_SUB_CHANNEL
 
 logger = logging.getLogger(__name__)
+
+UPLOAD_PROGRESS_THRESHOLD = 20 * 1024 * 1024   # show upload bar only for files > 20 MB
+_EDIT_INTERVAL = 4                              # seconds between progress message edits
 
 
 async def _safe_edit(msg, text: str):
@@ -35,6 +40,19 @@ async def download_handler(client, message: Message):
         )
         return
 
+    # ── Force-subscribe check ────────────────────────────────────────────────
+    if FORCE_SUB_CHANNEL:
+        try:
+            subscribed = await is_subscribed(client, user.id)
+        except Exception:
+            logger.exception("Force-sub check error for user %d", user.id)
+            subscribed = True   # fail open
+
+        if not subscribed:
+            await send_join_prompt(message)
+            return
+    # ────────────────────────────────────────────────────────────────────────
+
     try:
         get_or_create_user(user.id, user.username, user.first_name, user.last_name)
     except Exception:
@@ -49,7 +67,7 @@ async def download_handler(client, message: Message):
 
     if not allowed:
         if "free_limit_reached" in reason:
-            parts      = reason.split(":")
+            parts       = reason.split(":")
             used, limit = parts[1], parts[2]
             await message.reply_text(
                 f"You've used all {limit} free downloads.\n\n"
@@ -94,10 +112,10 @@ async def download_handler(client, message: Message):
 
     tracker = ProgressTracker()
 
-    async def update_progress():
+    async def update_download_progress():
         last_percent = -1
         while True:
-            await asyncio.sleep(4)
+            await asyncio.sleep(_EDIT_INTERVAL)
             if tracker.percent != last_percent and tracker.percent > 0:
                 last_percent = tracker.percent
                 bar = progress_bar(tracker.percent)
@@ -112,7 +130,7 @@ async def download_handler(client, message: Message):
                 break
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        progress_task = asyncio.create_task(update_progress())
+        progress_task = asyncio.create_task(update_download_progress())
 
         try:
             result = await asyncio.wait_for(
@@ -145,10 +163,33 @@ async def download_handler(client, message: Message):
         original_title = result["title"]
         thumb_path     = result.get("thumbnail_path")
 
+        # ── Upload progress (only for files > 20 MB) ────────────────────────
+        show_upload_bar = file_size > UPLOAD_PROGRESS_THRESHOLD
+
         await _safe_edit(
             status_msg,
-            f"📤 Uploading... ({format_size(file_size)})"
+            f"📤 **Uploading...** ({format_size(file_size)})\n\n**{title}**"
         )
+
+        # Throttle state shared with the callback closure
+        _last_edit = [0.0]
+
+        async def upload_progress(current: int, total: int):
+            now = time.monotonic()
+            if now - _last_edit[0] < _EDIT_INTERVAL:
+                return
+            _last_edit[0] = now
+            pct = int(current * 100 / total) if total else 0
+            bar = progress_bar(pct)
+            done_str = format_size(current)
+            total_str = format_size(total)
+            await _safe_edit(
+                status_msg,
+                f"📤 **Uploading...**\n\n"
+                f"**{title}**\n"
+                f"{bar}\n"
+                f"{done_str} / {total_str}"
+            )
 
         caption = original_title
 
@@ -159,6 +200,8 @@ async def download_handler(client, message: Message):
                 if remaining <= 2:
                     caption += f"\n\n⚠️ {remaining} free download(s) left — /plans"
 
+        progress_cb = upload_progress if show_upload_bar else None
+
         try:
             await client.send_video(
                 chat_id=message.chat.id,
@@ -166,6 +209,7 @@ async def download_handler(client, message: Message):
                 caption=caption,
                 thumb=thumb_path,
                 supports_streaming=True,
+                progress=progress_cb,
             )
         except Exception:
             try:
@@ -174,11 +218,13 @@ async def download_handler(client, message: Message):
                     document=filename,
                     caption=caption,
                     thumb=thumb_path,
+                    progress=progress_cb,
                 )
             except Exception as e:
                 logger.error("Upload failed for user %d: %s", user.id, str(e)[:200])
                 await _safe_edit(status_msg, f"Upload failed: `{str(e)[:200]}`")
                 return
+        # ────────────────────────────────────────────────────────────────────
 
         try:
             record_download(user.id, url, platform, file_size, "success")
