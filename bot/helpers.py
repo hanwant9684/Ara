@@ -21,9 +21,9 @@ _BARE_DOMAIN_RE = re.compile(
 
 PLANS = {
     "10days": {"days": 10, "price_usd": 2.99,  "label": "10 Days"},
-    "30days": {"days": 30, "price_usd": 6.99,  "label": "30 Days"},
-    "60days": {"days": 60, "price_usd": 11.99, "label": "60 Days"},
-    "90days": {"days": 90, "price_usd": 15.99, "label": "90 Days"},
+    "30days": {"days": 30, "price_usd": 3.99,  "label": "30 Days"},
+    "60days": {"days": 60, "price_usd": 7.99, "label": "60 Days"},
+    "90days": {"days": 90, "price_usd": 11.99, "label": "90 Days"},
 }
 
 PAYMENT_METHODS = {
