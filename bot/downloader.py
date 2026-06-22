@@ -4,14 +4,23 @@ import json
 import html as html_mod
 import asyncio
 import logging
+import random
 import subprocess
+import time
+import uuid
 import urllib.request
 import urllib.parse
 import urllib.error
 import yt_dlp
 import instaloader
+import requests
 
 logger = logging.getLogger(__name__)
+
+# Instagram: max 1 concurrent instaloader call + random jitter delays
+_IG_SEMAPHORE = asyncio.Semaphore(1)
+_IG_MIN_DELAY = 1.5   # seconds
+_IG_MAX_DELAY = 4.0
 
 MAX_FILE_SIZE      = 2000 * 1024 * 1024
 COMPRESS_THRESHOLD = 1900 * 1024 * 1024
@@ -247,6 +256,10 @@ INSTALOADER_SESSION_FILE = os.path.join(
 )
 _INSTALOADER_INSTANCE: instaloader.Instaloader | None = None
 
+# The Instagram app ID is required by Instagram's API alongside the session cookie.
+# Without it every graphql/query call returns 403 Forbidden.
+_IG_APP_ID = "936619743392459"
+
 
 def _build_instaloader() -> instaloader.Instaloader:
     return instaloader.Instaloader(
@@ -259,6 +272,67 @@ def _build_instaloader() -> instaloader.Instaloader:
         quiet=True,
         request_timeout=30,
     )
+
+
+def _patch_instaloader_headers(L: instaloader.Instaloader) -> None:
+    """
+    Inject the headers and cookies Instagram now requires for every API call.
+
+    Key fixes:
+      - X-IG-App-ID  — without this header Instagram returns 403 on graphql/query
+      - X-CSRFToken  — must match the csrftoken cookie
+      - ig_did       — must be a plausible UUID4, NOT the literal string "bot"
+      - csrftoken    — obtained from a real GET to instagram.com so Instagram sets it
+
+    All of these live on the underlying requests.Session used by instaloader so
+    they are sent automatically with every subsequent request.
+    """
+    sess = L.context._session
+
+    # 1. Visit the homepage with only the sessionid cookie so Instagram sets
+    #    csrftoken and other required cookies via Set-Cookie.
+    try:
+        resp = sess.get(
+            "https://www.instagram.com/",
+            headers={
+                "User-Agent": BROWSER_UA,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=15,
+            allow_redirects=True,
+        )
+        logger.debug("Instagram homepage status: %s", resp.status_code)
+    except Exception as exc:
+        logger.warning("Instagram: homepage pre-fetch failed (%s) — continuing without it", exc)
+
+    # 2. Generate a realistic ig_did (device ID) — a UUID4 in upper-case
+    ig_did = str(uuid.uuid4()).upper()
+    sess.cookies.set("ig_did", ig_did, domain=".instagram.com", path="/")
+    logger.debug("Instagram: ig_did set to %s", ig_did)
+
+    # 3. Extract the csrftoken that Instagram just set (or fall back to a random one)
+    csrftoken = sess.cookies.get("csrftoken", domain=".instagram.com") or ""
+    if not csrftoken:
+        csrftoken = uuid.uuid4().hex
+        sess.cookies.set("csrftoken", csrftoken, domain=".instagram.com", path="/")
+        logger.debug("Instagram: csrftoken not received from server, generated synthetic one")
+
+    # 4. Apply all required headers to the session
+    sess.headers.update({
+        "X-IG-App-ID":      _IG_APP_ID,
+        "X-CSRFToken":      csrftoken,
+        "X-Requested-With": "XMLHttpRequest",
+        "User-Agent":       BROWSER_UA,
+        "Referer":          "https://www.instagram.com/",
+        "Origin":           "https://www.instagram.com",
+    })
+
+
+def _reset_instaloader() -> None:
+    """Force the next call to _get_instaloader() to rebuild from scratch."""
+    global _INSTALOADER_INSTANCE
+    _INSTALOADER_INSTANCE = None
 
 
 def _get_instaloader() -> instaloader.Instaloader:
@@ -278,37 +352,43 @@ def _get_instaloader() -> instaloader.Instaloader:
     if username and os.path.exists(session_file):
         try:
             L.load_session_from_file(username, session_file)
-            test_user = L.context.test_login()   # real server-side check
+            _patch_instaloader_headers(L)
+            test_user = L.context.test_login()
             if test_user:
                 L.context.username = test_user
                 logger.info("Instagram: session file valid — logged in as @%s", test_user)
                 _INSTALOADER_INSTANCE = L
                 return L
             else:
-                logger.warning("Instagram: session file exists but is expired/invalid, re-authenticating")
+                logger.warning("Instagram: session file expired/invalid, re-authenticating")
                 L = _build_instaloader()
         except Exception as e:
-            logger.warning("Instagram: session file load failed (%s), will re-authenticate", e)
+            logger.warning("Instagram: session file load failed (%s), re-authenticating", e)
             L = _build_instaloader()
 
-    # 2. Inject INSTAGRAM_SESSION_ID cookie
+    # 2. Inject INSTAGRAM_SESSION_ID cookie then patch headers
     if session_id:
         try:
             L.context._session.cookies.set(
                 "sessionid", session_id, domain=".instagram.com", path="/"
             )
-            L.context._session.cookies.set(
-                "ig_did", "bot", domain=".instagram.com", path="/"
-            )
+            # Patch must happen AFTER sessionid is set so the homepage pre-fetch
+            # includes it, causing Instagram to set csrftoken for this session.
+            _patch_instaloader_headers(L)
+
             test_user = L.context.test_login()
             if test_user:
                 L.context.username = test_user
-                L.save_session_to_file(session_file)
-                logger.info("Instagram: session ID valid — logged in as @%s, session saved", test_user)
+                if username:
+                    try:
+                        L.save_session_to_file(session_file)
+                    except Exception:
+                        pass
+                logger.info("Instagram: session ID valid — logged in as @%s", test_user)
                 _INSTALOADER_INSTANCE = L
                 return L
             else:
-                logger.warning("Instagram: session ID did not authenticate, may be expired")
+                logger.warning("Instagram: session ID did not authenticate (may be expired)")
                 L = _build_instaloader()
         except Exception as e:
             logger.warning("Instagram: session ID injection failed (%s)", e)
@@ -317,6 +397,7 @@ def _get_instaloader() -> instaloader.Instaloader:
     # 3. Fall back to username + password login
     if username and password:
         try:
+            _patch_instaloader_headers(L)
             L.login(username, password)
             L.save_session_to_file(session_file)
             logger.info("Instagram: logged in as @%s via password, session saved", username)
@@ -325,12 +406,13 @@ def _get_instaloader() -> instaloader.Instaloader:
         except instaloader.exceptions.BadCredentialsException:
             logger.error("Instagram: bad credentials — check INSTAGRAM_USERNAME/PASSWORD")
         except instaloader.exceptions.TwoFactorAuthRequiredException:
-            logger.error("Instagram: 2FA is enabled — disable it or use INSTAGRAM_SESSION_ID instead")
+            logger.error("Instagram: 2FA is enabled — use INSTAGRAM_SESSION_ID instead")
         except Exception as e:
             logger.warning("Instagram: password login failed (%s)", e)
 
-    # 4. Anonymous fallback (works for some public posts)
-    logger.warning("Instagram: no valid auth — running anonymously, downloads may fail")
+    # 4. Anonymous fallback (public posts only; heavy rate-limiting applies)
+    logger.warning("Instagram: no valid auth — running anonymously (many posts will fail)")
+    _patch_instaloader_headers(L)
     _INSTALOADER_INSTANCE = L
     return L
 
@@ -378,11 +460,19 @@ def _instaloader_download(url: str, output_dir: str) -> dict:
 
     L = _get_instaloader()
 
+    # Random jitter: pause before every API call to mimic human browsing
+    time.sleep(random.uniform(_IG_MIN_DELAY, _IG_MAX_DELAY))
+
     try:
         post = instaloader.Post.from_shortcode(L.context, shortcode)
     except instaloader.exceptions.LoginRequiredException:
+        _reset_instaloader()
         raise _InstagramAuthError("This post requires login.")
     except Exception as e:
+        err = str(e)
+        # 403 on graphql often means the cached session is now dead — reset it
+        if "403" in err or "401" in err or "Forbidden" in err:
+            _reset_instaloader()
         raise _InstagramAuthError(f"Could not fetch post metadata — {e}")
 
     caption = post.caption or ""
@@ -531,6 +621,38 @@ def _instagram_embed_download(url: str, output_dir: str) -> dict:
 
 
 # ── Terabox ──────────────────────────────────────────────────────────────────
+#
+# Implementation based on rishi058/TeraBox-Video-Downloader (the correct way):
+#
+#   BASE DOMAIN : dm.1024tera.com  (NOT www.terabox.com)
+#   jsToken     : GET /wap/share/filelist?surl=SURL&clearCache=1
+#                 — token is URL-encoded in the page: fn%28%22HEX%22%29
+#                 — NO auth cookies needed for this step
+#   Share info  : GET /api/shorturlinfo
+#                 — shorturl must be prefixed with "1": "1" + surl
+#                 — params: web=1, channel=dubox, clienttype=0, dp-logid=random
+#                 — NO auth cookies needed for this step
+#   Download    : dlink from share info list → download with user cookies
+#                 — cookies set for .1024tera.com domain
+
+TERABOX_COOKIE = os.environ.get("TERABOX_COOKIE", "").strip()
+_TB_BASE = "https://dm.1024tera.com"
+
+
+def _tb_logid() -> str:
+    return str(random.randint(400_000_000_000_000_000, 999_999_999_999_999_999))
+
+
+def _tb_ua() -> str:
+    return random.choice([
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) "
+        "Gecko/20100101 Firefox/123.0",
+    ])
+
 
 def _terabox_extract_surl(url: str) -> str:
     m = re.search(r"/s/([A-Za-z0-9_-]+)", url)
@@ -542,90 +664,246 @@ def _terabox_extract_surl(url: str) -> str:
     raise ValueError("Could not extract Terabox share key from URL.")
 
 
-def _terabox_api(surl: str) -> dict:
-    params = urllib.parse.urlencode({
-        "app_id": "250528",
-        "shorturl": surl,
-        "root": "1",
+def _tb_clean_session() -> requests.Session:
+    """Unauthenticated session — used for jsToken and share metadata."""
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent":      _tb_ua(),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer":         f"{_TB_BASE}/wap/share/filelist",
     })
-    headers = {
-        "User-Agent": BROWSER_UA,
-        "Referer":    "https://www.terabox.com/",
-        "Accept":     "application/json, text/plain, */*",
-    }
-    url = f"https://www.terabox.com/api/shorturlinfo?{params}"
-    raw = _http_get(url, headers=headers, timeout=20)
-    data = json.loads(raw)
-    if data.get("errno", -1) != 0:
-        raise ValueError(f"Terabox API error: {data.get('errmsg', 'unknown error')}")
-    file_list = data.get("list", [])
-    if not file_list:
-        raise ValueError("Terabox returned an empty file list.")
-    return file_list[0]
+    return sess
 
 
-def _terabox_get_dlink(fs_id: str, surl: str) -> str:
-    params = urllib.parse.urlencode({
-        "app_id":  "250528",
-        "shorturl": surl,
-        "fid_list": f"[{fs_id}]",
+def _tb_cookie_str() -> str:
+    """
+    Build a raw Cookie header string from TERABOX_COOKIE.
+    Accepts Cookie Editor JSON export (array) or raw semicolon-separated string.
+    """
+    raw = TERABOX_COOKIE.strip()
+    if not raw:
+        return ""
+    if raw.startswith("["):
+        try:
+            items = json.loads(raw)
+            parts = []
+            for c in items:
+                if isinstance(c, dict) and c.get("name"):
+                    parts.append(f"{c['name']}={c.get('value', '')}")
+            return "; ".join(parts)
+        except json.JSONDecodeError:
+            pass
+    # Raw semicolon-separated string — use as-is
+    return raw
+
+
+def _tb_auth_session() -> requests.Session:
+    """
+    Authenticated session for the actual file download.
+    Cookies are injected via the Cookie header (bypasses jar domain matching).
+    """
+    sess = requests.Session()
+    cookie_str = _tb_cookie_str()
+    sess.headers.update({
+        "User-Agent":      _tb_ua(),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer":         f"{_TB_BASE}/",
+        "Cookie":          cookie_str,
     })
-    headers = {
-        "User-Agent": BROWSER_UA,
-        "Referer":    "https://www.terabox.com/",
-    }
-    raw = _http_get(
-        f"https://www.terabox.com/api/shorturlinfo?{params}&need_download_link=1",
-        headers=headers, timeout=20,
+    if not cookie_str:
+        logger.warning("Terabox: TERABOX_COOKIE is empty — download will likely fail")
+    return sess
+
+
+def _tb_get_jstoken(surl: str) -> str:
+    """
+    Fetch the WAP share page (no auth needed) and extract jsToken.
+
+    The WAP page URL-encodes the JS call that sets jsToken:
+      fn%28%22ACTUAL_HEX_TOKEN%22%29  →  fn("ACTUAL_HEX_TOKEN")
+    So we search for the URL-encoded form first, then fall back to
+    a decoded eval(decodeURIComponent(...)) block.
+    """
+    sess = _tb_clean_session()
+    url  = f"{_TB_BASE}/wap/share/filelist?surl={surl}&clearCache=1"
+
+    last_err = "unknown error"
+    for attempt in range(3):
+        try:
+            html = sess.get(url, timeout=60).text
+
+            # Primary: URL-encoded  fn%28%22TOKEN%22%29
+            m = re.search(r'fn%28%22([A-Fa-f0-9]+)%22%29', html)
+            if m:
+                logger.info("Terabox: jsToken via URL-encoded pattern (len=%d)", len(m.group(1)))
+                return m.group(1)
+
+            # Secondary: eval(decodeURIComponent(`...`))  containing fn("TOKEN")
+            m = re.search(r'eval\(decodeURIComponent\(`([^`]+)`\)\)', html)
+            if m:
+                decoded = urllib.parse.unquote(m.group(1))
+                m2 = re.search(r'fn\("([A-Fa-f0-9]+)"\)', decoded)
+                if m2:
+                    logger.info("Terabox: jsToken via eval/decode pattern (len=%d)",
+                                len(m2.group(1)))
+                    return m2.group(1)
+
+            # Tertiary: unescaped fn("TOKEN") anywhere in page
+            m = re.search(r'\bfn\s*\(\s*["\']([A-Fa-f0-9]{50,})["\']', html)
+            if m:
+                logger.info("Terabox: jsToken via fn() pattern (len=%d)", len(m.group(1)))
+                return m.group(1)
+
+            last_err = "token patterns not found in HTML"
+            logger.warning("Terabox jsToken attempt %d: not found. Page snippet: %s",
+                           attempt + 1, html[:200].replace("\n", " "))
+        except requests.RequestException as e:
+            last_err = str(e)
+            logger.warning("Terabox jsToken attempt %d failed: %s", attempt + 1, e)
+
+        if attempt < 2:
+            time.sleep(2)
+
+    raise ValueError(
+        f"Terabox: could not extract jsToken after 3 attempts — {last_err}\n"
+        "The share link may be invalid or TeraBox changed their page format."
     )
-    data = json.loads(raw)
-    dlink = (data.get("dlink") or "").strip()
-    if not dlink and data.get("list"):
-        dlink = (data["list"][0].get("dlink") or "").strip()
-    if not dlink:
-        raise ValueError("Terabox: could not retrieve a download link for this file.")
-    return dlink
+
+
+def _tb_share_info(jstoken: str, surl: str) -> dict:
+    """
+    Call the share info API to get file list + dlink.
+    Tries several endpoint/domain/shorturl combinations so that at least one
+    works regardless of which TeraBox mirror the link came from.
+
+    errno=400210 "need verify_v2" means the clean session hit a bot-check;
+    adding the user's cookies (via auth session) bypasses it.
+    """
+    base_params = {
+        "app_id":     "250528",
+        "root":       "1",
+        "web":        "1",
+        "channel":    "dubox",
+        "clienttype": "0",
+        "jsToken":    jstoken,
+        "t":          str(int(time.time())),
+        "dp-logid":   _tb_logid(),
+    }
+
+    attempts = [
+        # (base_url, endpoint, shorturl, use_auth_cookies)
+        (_TB_BASE,              "api/shorturlinfo", f"1{surl}", True),
+        (_TB_BASE,              "api/shorturlinfo", f"1{surl}", False),
+        (_TB_BASE,              "api/shorturlinfo", surl,       True),
+        ("https://www.terabox.com", "api/shorturlinfo", f"1{surl}", True),
+        ("https://www.terabox.com", "share/list",      surl,       True),
+        (_TB_BASE,              "share/list",      surl,       True),
+    ]
+
+    last_err = "all attempts exhausted"
+    for base, endpoint, shorturl, use_auth in attempts:
+        sess = _tb_auth_session() if use_auth else _tb_clean_session()
+        sess.headers.update({
+            "Accept":  "application/json, text/plain, */*",
+            "Origin":  base,
+            "Referer": f"{_TB_BASE}/wap/share/filelist?surl={surl}",
+        })
+        params = {**base_params, "shorturl": shorturl}
+        try:
+            resp = sess.get(f"{base}/{endpoint}", params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            errno = data.get("errno", -1)
+            if errno == 0 and data.get("list"):
+                logger.info("Terabox: share info OK via %s/%s shorturl=%s auth=%s",
+                            base, endpoint, shorturl, use_auth)
+                return data
+            logger.warning("Terabox %s/%s errno=%s errmsg=%s (shorturl=%s auth=%s)",
+                           base, endpoint, errno, data.get("errmsg"), shorturl, use_auth)
+            last_err = f"errno={errno} {data.get('errmsg', '')}"
+        except Exception as e:
+            logger.warning("Terabox %s/%s failed: %s", base, endpoint, e)
+            last_err = str(e)
+
+    raise ValueError(
+        f"Terabox: could not retrieve share info — {last_err}\n\n"
+        "If this keeps happening, re-export your TERABOX_COOKIE from "
+        "1024terabox.com (log in, use Cookie Editor, export JSON)."
+    )
+
+
+def _tb_stream_download(dlink: str, filename: str) -> int:
+    """Download dlink to filename using auth cookies. Returns file size in bytes."""
+    sess = _tb_auth_session()
+    resp = sess.get(
+        dlink,
+        stream=True,
+        timeout=600,
+        allow_redirects=True,
+        headers={"Referer": f"{_TB_BASE}/"},
+    )
+    resp.raise_for_status()
+    with open(filename, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
+    return os.path.getsize(filename)
 
 
 def _terabox_download(url: str, output_dir: str) -> dict:
-    surl     = _terabox_extract_surl(url)
-    fileinfo = _terabox_api(surl)
+    surl = _terabox_extract_surl(url)
 
-    server_filename = fileinfo.get("server_filename", "terabox_video.mp4")
-    fs_id           = str(fileinfo.get("fs_id", ""))
-    file_size_remote = int(fileinfo.get("size", 0))
+    # Step 1: get jsToken (no auth required)
+    jstoken = _tb_get_jstoken(surl)
 
-    category = int(fileinfo.get("category", 0))
-    if category not in (1, 3):
+    # Step 2: get file metadata via api/shorturlinfo (no auth required)
+    info  = _tb_share_info(jstoken, surl)
+    files = info.get("list", [])
+    if not files:
+        raise ValueError("Terabox: share returned an empty file list.")
+
+    fileinfo        = files[0]
+    server_filename = fileinfo.get("server_filename", "terabox_file")
+    category        = int(fileinfo.get("category", 0))
+    ext             = os.path.splitext(server_filename)[1] or ".mp4"
+    title           = os.path.splitext(server_filename)[0]
+
+    # Step 3: get dlink — it is usually directly in the file list item
+    dlink = (fileinfo.get("dlink") or "").strip()
+    if not dlink:
         raise ValueError(
-            f"Terabox: this file doesn't appear to be a video (category={category}).\n"
-            "Only video files are supported."
+            "Terabox: no direct download link in share info.\n"
+            "The file may require a premium TeraBox account.\n"
+            f"(errno=0 but dlink missing for: {server_filename})"
         )
 
-    ext      = os.path.splitext(server_filename)[1] or ".mp4"
-    title    = os.path.splitext(server_filename)[0]
-    filename = os.path.join(output_dir, f"{_safe_title(title) or 'terabox'}{ext}")
+    logger.info("Terabox: downloading '%s' via dlink", server_filename)
 
-    dlink = _terabox_get_dlink(fs_id, surl)
+    # Step 4: download with auth cookies
+    if not TERABOX_COOKIE:
+        raise ValueError(
+            "Terabox: TERABOX_COOKIE is not set.\n\n"
+            "To download TeraBox files:\n"
+            "1. Open 1024terabox.com in Firefox and log in\n"
+            "2. Install the Cookie Editor extension\n"
+            "3. Click Export → Copy to clipboard (JSON format)\n"
+            "4. Paste the JSON as the TERABOX_COOKIE secret in Replit"
+        )
 
-    req = urllib.request.Request(dlink, headers={
-        "User-Agent": BROWSER_UA,
-        "Referer":    "https://www.terabox.com/",
-    })
-    with urllib.request.urlopen(req, timeout=600) as resp:
-        with open(filename, "wb") as f:
-            while True:
-                chunk = resp.read(1024 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
+    filename  = os.path.join(output_dir, f"{_safe_title(title) or 'terabox'}{ext}")
+    file_size = _tb_stream_download(dlink, filename)
 
-    file_size = os.path.getsize(filename)
+    if file_size == 0:
+        raise ValueError("Terabox: downloaded file is empty.")
     if file_size > MAX_FILE_SIZE:
         raise ValueError(
             f"Terabox file is {file_size // 1024 // 1024} MB — exceeds Telegram's 2 GB limit."
         )
-    if file_size > COMPRESS_THRESHOLD:
+
+    is_video = category == 1 or ext.lower() in (
+        ".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".m4v", ".3gp"
+    )
+    if is_video and file_size > COMPRESS_THRESHOLD:
         filename  = _compress_video(filename)
         file_size = os.path.getsize(filename)
 
@@ -637,6 +915,7 @@ def _terabox_download(url: str, output_dir: str) -> dict:
         "file_size":      file_size,
         "thumbnail":      None,
         "thumbnail_path": None,
+        "is_video":       is_video,
     }
 
 
@@ -776,11 +1055,20 @@ async def download_video(url: str, output_dir: str, tracker: ProgressTracker = N
             result = await loop.run_in_executor(None, _tikwm_download, url, output_dir)
 
         elif _is_instagram(url):
-            try:
-                result = await loop.run_in_executor(None, _instaloader_download, url, output_dir)
-            except _InstagramAuthError as e:
-                logger.warning("Instagram instaloader failed (%s), trying embed fallback", e)
-                result = await loop.run_in_executor(None, _instagram_embed_download, url, output_dir)
+            # Semaphore ensures only one instaloader call runs at a time across
+            # all concurrent users — rapid parallel calls are the #1 ban trigger.
+            async with _IG_SEMAPHORE:
+                try:
+                    result = await loop.run_in_executor(
+                        None, _instaloader_download, url, output_dir
+                    )
+                except _InstagramAuthError as e:
+                    logger.warning(
+                        "Instagram instaloader failed (%s), trying embed fallback", e
+                    )
+                    result = await loop.run_in_executor(
+                        None, _instagram_embed_download, url, output_dir
+                    )
 
         elif _is_terabox(url):
             result = await loop.run_in_executor(None, _terabox_download, url, output_dir)
@@ -789,8 +1077,13 @@ async def download_video(url: str, output_dir: str, tracker: ProgressTracker = N
             result = await loop.run_in_executor(None, _ytdlp_download, url, output_dir, tracker)
 
         if not result.get("thumbnail_path"):
-            thumb = await loop.run_in_executor(None, _extract_thumbnail, result["filename"])
-            result["thumbnail_path"] = thumb
+            try:
+                thumb = await loop.run_in_executor(
+                    None, _extract_thumbnail, result["filename"]
+                )
+                result["thumbnail_path"] = thumb
+            except Exception:
+                pass
 
         return result
 
