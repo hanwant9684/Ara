@@ -3,11 +3,15 @@ import re
 import json
 import html as html_mod
 import asyncio
+import logging
 import subprocess
 import urllib.request
 import urllib.parse
 import urllib.error
 import yt_dlp
+import instaloader
+
+logger = logging.getLogger(__name__)
 
 MAX_FILE_SIZE      = 2000 * 1024 * 1024
 COMPRESS_THRESHOLD = 1900 * 1024 * 1024
@@ -38,12 +42,27 @@ PLATFORM_MAP = {
     "triller.co": "Triller",
     "likee.video": "Likee",
     "coub.com": "Coub",
+    "terabox.com": "Terabox",
+    "1024terabox.com": "Terabox",
+    "freeterabox.com": "Terabox",
+    "4funbox.com": "Terabox",
+    "teraboxapp.com": "Terabox",
+    "mirrobox.com": "Terabox",
+    "nephobox.com": "Terabox",
+    "momerybox.com": "Terabox",
+    "tibibox.com": "Terabox",
 }
 
 IMPERSONATE_DOMAINS = (
     "twitter.com", "x.com",
     "facebook.com", "fb.watch",
     "pinterest.com", "snapchat.com", "linkedin.com",
+)
+
+TERABOX_DOMAINS = (
+    "terabox.com", "1024terabox.com", "freeterabox.com",
+    "4funbox.com", "teraboxapp.com", "mirrobox.com",
+    "nephobox.com", "momerybox.com", "tibibox.com",
 )
 
 try:
@@ -67,6 +86,10 @@ def _is_tiktok(url: str) -> bool:
 
 def _is_instagram(url: str) -> bool:
     return "instagram.com" in url.lower()
+
+
+def _is_terabox(url: str) -> bool:
+    return any(d in url.lower() for d in TERABOX_DOMAINS)
 
 
 def _needs_impersonation(url: str) -> bool:
@@ -157,6 +180,8 @@ def _safe_title(title: str, maxlen: int = 50) -> str:
     return "".join(c for c in title[:maxlen] if c.isalnum() or c in " -_").strip()
 
 
+# ── TikTok ───────────────────────────────────────────────────────────────────
+
 def _tikwm_api(url: str) -> dict:
     actual = url
     if "vt.tiktok.com" in url.lower() or "vm.tiktok.com" in url.lower():
@@ -215,7 +240,217 @@ def _tikwm_download(url: str, output_dir: str) -> dict:
     }
 
 
+# ── Instagram (instaloader + session auth + embed fallback) ──────────────────
+
+INSTALOADER_SESSION_FILE = os.path.join(
+    os.path.dirname(__file__), "..", ".instagram_session"
+)
+_INSTALOADER_INSTANCE: instaloader.Instaloader | None = None
+
+
+def _build_instaloader() -> instaloader.Instaloader:
+    return instaloader.Instaloader(
+        download_videos=True,
+        download_video_thumbnails=False,
+        download_geotags=False,
+        download_comments=False,
+        save_metadata=False,
+        post_metadata_txt_pattern="",
+        quiet=True,
+        request_timeout=30,
+    )
+
+
+def _get_instaloader() -> instaloader.Instaloader:
+    """Return a logged-in Instaloader instance, cached for the process lifetime."""
+    global _INSTALOADER_INSTANCE
+    if _INSTALOADER_INSTANCE is not None:
+        return _INSTALOADER_INSTANCE
+
+    username     = os.environ.get("INSTAGRAM_USERNAME", "").strip()
+    password     = os.environ.get("INSTAGRAM_PASSWORD", "").strip()
+    session_id   = urllib.parse.unquote(os.environ.get("INSTAGRAM_SESSION_ID", "").strip())
+    session_file = os.path.abspath(INSTALOADER_SESSION_FILE)
+
+    L = _build_instaloader()
+
+    # 1. Try loading saved session file first (fastest — avoids re-auth on restart)
+    if username and os.path.exists(session_file):
+        try:
+            L.load_session_from_file(username, session_file)
+            test_user = L.context.test_login()   # real server-side check
+            if test_user:
+                L.context.username = test_user
+                logger.info("Instagram: session file valid — logged in as @%s", test_user)
+                _INSTALOADER_INSTANCE = L
+                return L
+            else:
+                logger.warning("Instagram: session file exists but is expired/invalid, re-authenticating")
+                L = _build_instaloader()
+        except Exception as e:
+            logger.warning("Instagram: session file load failed (%s), will re-authenticate", e)
+            L = _build_instaloader()
+
+    # 2. Inject INSTAGRAM_SESSION_ID cookie
+    if session_id:
+        try:
+            L.context._session.cookies.set(
+                "sessionid", session_id, domain=".instagram.com", path="/"
+            )
+            L.context._session.cookies.set(
+                "ig_did", "bot", domain=".instagram.com", path="/"
+            )
+            test_user = L.context.test_login()
+            if test_user:
+                L.context.username = test_user
+                L.save_session_to_file(session_file)
+                logger.info("Instagram: session ID valid — logged in as @%s, session saved", test_user)
+                _INSTALOADER_INSTANCE = L
+                return L
+            else:
+                logger.warning("Instagram: session ID did not authenticate, may be expired")
+                L = _build_instaloader()
+        except Exception as e:
+            logger.warning("Instagram: session ID injection failed (%s)", e)
+            L = _build_instaloader()
+
+    # 3. Fall back to username + password login
+    if username and password:
+        try:
+            L.login(username, password)
+            L.save_session_to_file(session_file)
+            logger.info("Instagram: logged in as @%s via password, session saved", username)
+            _INSTALOADER_INSTANCE = L
+            return L
+        except instaloader.exceptions.BadCredentialsException:
+            logger.error("Instagram: bad credentials — check INSTAGRAM_USERNAME/PASSWORD")
+        except instaloader.exceptions.TwoFactorAuthRequiredException:
+            logger.error("Instagram: 2FA is enabled — disable it or use INSTAGRAM_SESSION_ID instead")
+        except Exception as e:
+            logger.warning("Instagram: password login failed (%s)", e)
+
+    # 4. Anonymous fallback (works for some public posts)
+    logger.warning("Instagram: no valid auth — running anonymously, downloads may fail")
+    _INSTALOADER_INSTANCE = L
+    return L
+
+
+def _download_ig_node(node, idx: int, output_dir: str) -> dict:
+    """Download a single Instagram post node (video or image).
+    Works for both Post and PostSidecarNode objects."""
+    if node.is_video:
+        url  = node.video_url
+        ext  = ".mp4"
+        kind = "video"
+    else:
+        # PostSidecarNode uses display_url; Post uses url
+        url  = getattr(node, "display_url", None) or getattr(node, "url", None)
+        ext  = ".jpg"
+        kind = "photo"
+
+    filename = os.path.join(output_dir, f"instagram_{idx}{ext}")
+    data = _http_get(
+        url,
+        headers={"User-Agent": BROWSER_UA, "Referer": "https://www.instagram.com/"},
+        timeout=300,
+    )
+    with open(filename, "wb") as f:
+        f.write(data)
+
+    file_size = os.path.getsize(filename)
+    if kind == "video" and file_size > COMPRESS_THRESHOLD:
+        filename  = _compress_video(filename)
+        file_size = os.path.getsize(filename)
+
+    return {
+        "filename":       filename,
+        "file_size":      file_size,
+        "is_video":       kind == "video",
+        "thumbnail_path": None,
+    }
+
+
+def _instaloader_download(url: str, output_dir: str) -> dict:
+    sc = re.search(r"/(?:p|reel|tv)/([A-Za-z0-9_-]+)", url)
+    if not sc:
+        raise ValueError("Could not find Instagram post shortcode in URL.")
+    shortcode = sc.group(1)
+
+    L = _get_instaloader()
+
+    try:
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
+    except instaloader.exceptions.LoginRequiredException:
+        raise _InstagramAuthError("This post requires login.")
+    except Exception as e:
+        raise _InstagramAuthError(f"Could not fetch post metadata — {e}")
+
+    caption = post.caption or ""
+    title   = caption[:100].split("\n")[0].strip() if caption else "Instagram Post"
+
+    # ── Carousel / sidecar (multiple images or videos) ───────────────────────
+    if post.typename == "GraphSidecar":
+        nodes = list(post.get_sidecar_nodes())
+        files = []
+        for i, node in enumerate(nodes):
+            try:
+                files.append(_download_ig_node(node, i + 1, output_dir))
+            except Exception as e:
+                logger.warning("Instagram: skipping carousel node %d — %s", i + 1, e)
+
+        if not files:
+            raise ValueError("Instagram: could not download any items from this carousel.")
+
+        total_size = sum(f["file_size"] for f in files)
+        return {
+            "title":          title,
+            "duration":       0,
+            "platform":       "Instagram",
+            "filename":       files[0]["filename"],
+            "file_size":      total_size,
+            "thumbnail":      post.url,
+            "thumbnail_path": None,
+            "files":          files,
+        }
+
+    # ── Single video ─────────────────────────────────────────────────────────
+    if post.is_video:
+        video_url = post.video_url
+        if not video_url:
+            raise _InstagramAuthError("instaloader returned no video URL for this post.")
+
+        file_info = _download_ig_node(post, 1, output_dir)
+        return {
+            "title":          title,
+            "duration":       post.video_duration or 0,
+            "platform":       "Instagram",
+            "filename":       file_info["filename"],
+            "file_size":      file_info["file_size"],
+            "thumbnail":      post.url,
+            "thumbnail_path": None,
+            "files":          [file_info],
+        }
+
+    # ── Single image ─────────────────────────────────────────────────────────
+    file_info = _download_ig_node(post, 1, output_dir)
+    return {
+        "title":          title,
+        "duration":       0,
+        "platform":       "Instagram",
+        "filename":       file_info["filename"],
+        "file_size":      file_info["file_size"],
+        "thumbnail":      post.url,
+        "thumbnail_path": None,
+        "files":          [file_info],
+    }
+
+
+class _InstagramAuthError(Exception):
+    """Raised when instaloader fails due to auth/block — triggers embed fallback."""
+
+
 def _instagram_embed_download(url: str, output_dir: str) -> dict:
+    """Best-effort fallback: extract video from Instagram's public embed page."""
     sc = re.search(r"/(?:p|reel|tv)/([A-Za-z0-9_-]+)", url)
     if not sc:
         raise ValueError("Could not find Instagram post ID in URL.")
@@ -243,7 +478,7 @@ def _instagram_embed_download(url: str, output_dir: str) -> dict:
 
     if not page:
         raise ValueError(
-            "Instagram: could not reach embed page.\n"
+            "Instagram: could not reach the embed page.\n"
             "The post may be private or Instagram is blocking access."
         )
 
@@ -254,9 +489,8 @@ def _instagram_embed_download(url: str, output_dir: str) -> dict:
     )
     if not video_match:
         raise ValueError(
-            "Instagram download failed — the video could not be extracted.\n"
-            "Instagram restricts most Reels without a logged-in account.\n"
-            "Consider asking the sender to share the file directly."
+            "Instagram download failed — the video could not be extracted from the embed page.\n"
+            "The post may require a logged-in account."
         )
 
     video_url = html_mod.unescape(
@@ -276,7 +510,11 @@ def _instagram_embed_download(url: str, output_dir: str) -> dict:
     )
 
     filename = os.path.join(output_dir, f"{_safe_title(title) or 'instagram'}.mp4")
-    data = _http_get(video_url, headers={"User-Agent": BROWSER_UA, "Referer": "https://www.instagram.com/"}, timeout=300)
+    data = _http_get(
+        video_url,
+        headers={"User-Agent": BROWSER_UA, "Referer": "https://www.instagram.com/"},
+        timeout=300,
+    )
     with open(filename, "wb") as f:
         f.write(data)
 
@@ -291,6 +529,118 @@ def _instagram_embed_download(url: str, output_dir: str) -> dict:
         "thumbnail": thumbnail, "thumbnail_path": None,
     }
 
+
+# ── Terabox ──────────────────────────────────────────────────────────────────
+
+def _terabox_extract_surl(url: str) -> str:
+    m = re.search(r"/s/([A-Za-z0-9_-]+)", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]surl=([A-Za-z0-9_%-]+)", url)
+    if m:
+        return urllib.parse.unquote(m.group(1))
+    raise ValueError("Could not extract Terabox share key from URL.")
+
+
+def _terabox_api(surl: str) -> dict:
+    params = urllib.parse.urlencode({
+        "app_id": "250528",
+        "shorturl": surl,
+        "root": "1",
+    })
+    headers = {
+        "User-Agent": BROWSER_UA,
+        "Referer":    "https://www.terabox.com/",
+        "Accept":     "application/json, text/plain, */*",
+    }
+    url = f"https://www.terabox.com/api/shorturlinfo?{params}"
+    raw = _http_get(url, headers=headers, timeout=20)
+    data = json.loads(raw)
+    if data.get("errno", -1) != 0:
+        raise ValueError(f"Terabox API error: {data.get('errmsg', 'unknown error')}")
+    file_list = data.get("list", [])
+    if not file_list:
+        raise ValueError("Terabox returned an empty file list.")
+    return file_list[0]
+
+
+def _terabox_get_dlink(fs_id: str, surl: str) -> str:
+    params = urllib.parse.urlencode({
+        "app_id":  "250528",
+        "shorturl": surl,
+        "fid_list": f"[{fs_id}]",
+    })
+    headers = {
+        "User-Agent": BROWSER_UA,
+        "Referer":    "https://www.terabox.com/",
+    }
+    raw = _http_get(
+        f"https://www.terabox.com/api/shorturlinfo?{params}&need_download_link=1",
+        headers=headers, timeout=20,
+    )
+    data = json.loads(raw)
+    dlink = (data.get("dlink") or "").strip()
+    if not dlink and data.get("list"):
+        dlink = (data["list"][0].get("dlink") or "").strip()
+    if not dlink:
+        raise ValueError("Terabox: could not retrieve a download link for this file.")
+    return dlink
+
+
+def _terabox_download(url: str, output_dir: str) -> dict:
+    surl     = _terabox_extract_surl(url)
+    fileinfo = _terabox_api(surl)
+
+    server_filename = fileinfo.get("server_filename", "terabox_video.mp4")
+    fs_id           = str(fileinfo.get("fs_id", ""))
+    file_size_remote = int(fileinfo.get("size", 0))
+
+    category = int(fileinfo.get("category", 0))
+    if category not in (1, 3):
+        raise ValueError(
+            f"Terabox: this file doesn't appear to be a video (category={category}).\n"
+            "Only video files are supported."
+        )
+
+    ext      = os.path.splitext(server_filename)[1] or ".mp4"
+    title    = os.path.splitext(server_filename)[0]
+    filename = os.path.join(output_dir, f"{_safe_title(title) or 'terabox'}{ext}")
+
+    dlink = _terabox_get_dlink(fs_id, surl)
+
+    req = urllib.request.Request(dlink, headers={
+        "User-Agent": BROWSER_UA,
+        "Referer":    "https://www.terabox.com/",
+    })
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        with open(filename, "wb") as f:
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+
+    file_size = os.path.getsize(filename)
+    if file_size > MAX_FILE_SIZE:
+        raise ValueError(
+            f"Terabox file is {file_size // 1024 // 1024} MB — exceeds Telegram's 2 GB limit."
+        )
+    if file_size > COMPRESS_THRESHOLD:
+        filename  = _compress_video(filename)
+        file_size = os.path.getsize(filename)
+
+    return {
+        "title":          title,
+        "duration":       0,
+        "platform":       "Terabox",
+        "filename":       filename,
+        "file_size":      file_size,
+        "thumbnail":      None,
+        "thumbnail_path": None,
+    }
+
+
+# ── yt-dlp (generic) ─────────────────────────────────────────────────────────
 
 def _make_ytdlp_opts(output_dir: str, progress_hook=None, impersonate: bool = False) -> dict:
     opts = {
@@ -387,6 +737,8 @@ def _ytdlp_download(url: str, output_dir: str, tracker=None) -> dict:
         }
 
 
+# ── Progress tracker ─────────────────────────────────────────────────────────
+
 class ProgressTracker:
     def __init__(self):
         self.percent = 0
@@ -404,15 +756,16 @@ class ProgressTracker:
             self.percent = 100
 
 
+# ── Public API ────────────────────────────────────────────────────────────────
+
 async def get_video_info(url: str) -> dict:
     loop = asyncio.get_event_loop()
     if _is_tiktok(url):
         return await loop.run_in_executor(None, _tikwm_info, url)
     if _is_instagram(url):
-        try:
-            return await loop.run_in_executor(None, _ytdlp_info, url)
-        except Exception:
-            return {"title": "Instagram Video", "duration": 0, "platform": "Instagram"}
+        return {"title": "Instagram Video", "duration": 0, "platform": "Instagram"}
+    if _is_terabox(url):
+        return {"title": "Terabox Video", "duration": 0, "platform": "Terabox"}
     return await loop.run_in_executor(None, _ytdlp_info, url)
 
 
@@ -424,13 +777,13 @@ async def download_video(url: str, output_dir: str, tracker: ProgressTracker = N
 
         elif _is_instagram(url):
             try:
-                result = await loop.run_in_executor(None, _ytdlp_download, url, output_dir, tracker)
-            except Exception as e:
-                err = str(e).lower()
-                if any(k in err for k in ("login", "private", "403", "401", "not found", "unable to extract", "blocked")):
-                    result = await loop.run_in_executor(None, _instagram_embed_download, url, output_dir)
-                else:
-                    raise
+                result = await loop.run_in_executor(None, _instaloader_download, url, output_dir)
+            except _InstagramAuthError as e:
+                logger.warning("Instagram instaloader failed (%s), trying embed fallback", e)
+                result = await loop.run_in_executor(None, _instagram_embed_download, url, output_dir)
+
+        elif _is_terabox(url):
+            result = await loop.run_in_executor(None, _terabox_download, url, output_dir)
 
         else:
             result = await loop.run_in_executor(None, _ytdlp_download, url, output_dir, tracker)

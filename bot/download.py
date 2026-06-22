@@ -2,7 +2,7 @@ import logging
 import asyncio
 import time
 import tempfile
-from pyrogram.types import Message
+from pyrogram.types import Message, InputMediaVideo, InputMediaPhoto
 from pyrogram.errors import FloodWait
 from bot.db import get_or_create_user, try_consume_download, record_download, is_premium, get_user
 from bot.downloader import download_video, ProgressTracker, detect_platform, get_video_info
@@ -158,41 +158,17 @@ async def download_handler(client, message: Message):
             await _safe_edit(status_msg, f"Something went wrong: `{str(e)[:200]}`")
             return
 
-        filename       = result["filename"]
-        file_size      = result["file_size"]
         original_title = result["title"]
+        file_size      = result["file_size"]
         thumb_path     = result.get("thumbnail_path")
-
-        # ── Upload progress (only for files > 20 MB) ────────────────────────
-        show_upload_bar = file_size > UPLOAD_PROGRESS_THRESHOLD
+        files          = result.get("files")  # list of {filename, file_size, is_video}
 
         await _safe_edit(
             status_msg,
             f"📤 **Uploading...** ({format_size(file_size)})\n\n**{title}**"
         )
 
-        # Throttle state shared with the callback closure
-        _last_edit = [0.0]
-
-        async def upload_progress(current: int, total: int):
-            now = time.monotonic()
-            if now - _last_edit[0] < _EDIT_INTERVAL:
-                return
-            _last_edit[0] = now
-            pct = int(current * 100 / total) if total else 0
-            bar = progress_bar(pct)
-            done_str = format_size(current)
-            total_str = format_size(total)
-            await _safe_edit(
-                status_msg,
-                f"📤 **Uploading...**\n\n"
-                f"**{title}**\n"
-                f"{bar}\n"
-                f"{done_str} / {total_str}"
-            )
-
         caption = original_title
-
         if not is_premium(user.id):
             db_user = get_user(user.id)
             if db_user:
@@ -200,30 +176,75 @@ async def download_handler(client, message: Message):
                 if remaining <= 2:
                     caption += f"\n\n⚠️ {remaining} free download(s) left — /plans"
 
-        progress_cb = upload_progress if show_upload_bar else None
-
-        try:
-            await client.send_video(
-                chat_id=message.chat.id,
-                video=filename,
-                caption=caption,
-                thumb=thumb_path,
-                supports_streaming=True,
-                progress=progress_cb,
-            )
-        except Exception:
+        # ── Multi-file (carousel / album) ────────────────────────────────────
+        if files and len(files) > 1:
+            media_group = []
+            for i, f in enumerate(files):
+                cap = caption if i == 0 else None
+                if f["is_video"]:
+                    media_group.append(
+                        InputMediaVideo(f["filename"], caption=cap, supports_streaming=True)
+                    )
+                else:
+                    media_group.append(
+                        InputMediaPhoto(f["filename"], caption=cap)
+                    )
             try:
-                await client.send_document(
+                await client.send_media_group(
                     chat_id=message.chat.id,
-                    document=filename,
-                    caption=caption,
-                    thumb=thumb_path,
-                    progress=progress_cb,
+                    media=media_group,
                 )
             except Exception as e:
-                logger.error("Upload failed for user %d: %s", user.id, str(e)[:200])
+                logger.error("Media group upload failed for user %d: %s", user.id, str(e)[:200])
                 await _safe_edit(status_msg, f"Upload failed: `{str(e)[:200]}`")
                 return
+
+        # ── Single file ──────────────────────────────────────────────────────
+        else:
+            filename = result["filename"]
+            show_upload_bar = file_size > UPLOAD_PROGRESS_THRESHOLD
+
+            _last_edit = [0.0]
+
+            async def upload_progress(current: int, total: int):
+                now = time.monotonic()
+                if now - _last_edit[0] < _EDIT_INTERVAL:
+                    return
+                _last_edit[0] = now
+                pct = int(current * 100 / total) if total else 0
+                bar = progress_bar(pct)
+                await _safe_edit(
+                    status_msg,
+                    f"📤 **Uploading...**\n\n"
+                    f"**{title}**\n"
+                    f"{bar}\n"
+                    f"{format_size(current)} / {format_size(total)}"
+                )
+
+            progress_cb = upload_progress if show_upload_bar else None
+
+            try:
+                await client.send_video(
+                    chat_id=message.chat.id,
+                    video=filename,
+                    caption=caption,
+                    thumb=thumb_path,
+                    supports_streaming=True,
+                    progress=progress_cb,
+                )
+            except Exception:
+                try:
+                    await client.send_document(
+                        chat_id=message.chat.id,
+                        document=filename,
+                        caption=caption,
+                        thumb=thumb_path,
+                        progress=progress_cb,
+                    )
+                except Exception as e:
+                    logger.error("Upload failed for user %d: %s", user.id, str(e)[:200])
+                    await _safe_edit(status_msg, f"Upload failed: `{str(e)[:200]}`")
+                    return
         # ────────────────────────────────────────────────────────────────────
 
         try:
