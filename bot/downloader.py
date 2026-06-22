@@ -18,7 +18,7 @@ import requests
 logger = logging.getLogger(__name__)
 
 # Instagram: max 1 concurrent instaloader call + random jitter delays
-_IG_SEMAPHORE = asyncio.Semaphore(1)
+_IG_SEMAPHORE = asyncio.Semaphore(5)
 _IG_MIN_DELAY = 1.5   # seconds
 _IG_MAX_DELAY = 4.0
 
