@@ -10,3 +10,4 @@ apscheduler
 humanize
 cryptg
 curl_cffi
+instaloader
